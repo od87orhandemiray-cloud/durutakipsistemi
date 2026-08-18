@@ -431,6 +431,7 @@ if st.session_state.admin:
         else:
             with st.form("gunluk_giris_formu"):
                 girisler = []
+                sure_hatali = []
                 for birim in BIRIMLER + ["Atanmamış"]:
                     grup = uyeler[uyeler["Birim"] == birim] if birim != "Atanmamış" else uyeler[~uyeler["Birim"].isin(BIRIMLER)]
                     if grup.empty:
@@ -455,33 +456,37 @@ if st.session_state.admin:
                             mevcut_sn = 0
 
                         if birim == "Retler":
-                            c0, c1, c2, c3, c4, c5, c6 = st.columns([1.1, 0.9, 0.7, 0.7, 0.7, 0.9, 0.9])
+                            c0, c1, c2, c3, c4 = st.columns([1.3, 1, 1.1, 1, 1])
                             izin_durumu = c0.selectbox("İzin Durumu", IZIN_SECENEKLERI, index=izin_idx, key=f"izin_{ad}_{tarih_str}")
                             arama = c1.number_input("Arama Sayısı", min_value=0, value=int(m["Arama Sayisi"]) if m is not None else 0, key=f"arama_{ad}_{tarih_str}")
-                            sure_saat = c2.number_input("Süre Saat", min_value=0, value=mevcut_sn // 3600, key=f"suresaat_{ad}_{tarih_str}")
-                            sure_dk = c3.number_input("Süre Dk", min_value=0, max_value=59, value=(mevcut_sn % 3600) // 60, key=f"suredk_{ad}_{tarih_str}")
-                            sure_sn = c4.number_input("Süre Sn", min_value=0, max_value=59, value=mevcut_sn % 60, key=f"suresn_{ad}_{tarih_str}")
-                            depozit = c5.number_input("Depozit", min_value=0, value=int(m["Depozit"]) if m is not None else 0, key=f"depozit_{ad}_{tarih_str}")
-                            dep_adet = c6.number_input("Dep Adet", min_value=0, value=int(m["Dep Adet"]) if m is not None else 0, key=f"depadet_{ad}_{tarih_str}")
+                            sure_metin = c2.text_input("Arama Süresi (sa:dk:sn)", value=saniye_to_hhmmss(mevcut_sn), key=f"sure_{ad}_{tarih_str}")
+                            depozit = c3.number_input("Depozit", min_value=0, value=int(m["Depozit"]) if m is not None else 0, key=f"depozit_{ad}_{tarih_str}")
+                            dep_adet = c4.number_input("Dep Adet", min_value=0, value=int(m["Dep Adet"]) if m is not None else 0, key=f"depadet_{ad}_{tarih_str}")
                             st.markdown("---")
+                            sure_sn_parsed = hhmmss_to_saniye(sure_metin)
+                            if sure_sn_parsed is None:
+                                sure_hatali.append(ad)
+                                sure_sn_parsed = 0
                             girisler.append({
                                 "Ad Soyad": ad, "Dahili": dahili, "Arama Sayisi": arama,
-                                "Arama Suresi Sn": sure_saat * 3600 + sure_dk * 60 + sure_sn,
+                                "Arama Suresi Sn": sure_sn_parsed,
                                 "Depozit": depozit, "Dep Adet": dep_adet,
                                 "Izin Durumu": izin_durumu,
                             })
 
                         elif birim == "Satış Ekibi":
-                            c0, c1, c2, c3, c4 = st.columns([1.2, 1, 0.8, 0.8, 0.8])
+                            c0, c1, c2 = st.columns([1.3, 1, 1.1])
                             izin_durumu = c0.selectbox("İzin Durumu", IZIN_SECENEKLERI, index=izin_idx, key=f"izin_{ad}_{tarih_str}")
                             arama = c1.number_input("Arama Sayısı", min_value=0, value=int(m["Arama Sayisi"]) if m is not None else 0, key=f"arama_{ad}_{tarih_str}")
-                            sure_saat = c2.number_input("Süre Saat", min_value=0, value=mevcut_sn // 3600, key=f"suresaat_{ad}_{tarih_str}")
-                            sure_dk = c3.number_input("Süre Dk", min_value=0, max_value=59, value=(mevcut_sn % 3600) // 60, key=f"suredk_{ad}_{tarih_str}")
-                            sure_sn = c4.number_input("Süre Sn", min_value=0, max_value=59, value=mevcut_sn % 60, key=f"suresn_{ad}_{tarih_str}")
+                            sure_metin = c2.text_input("Arama Süresi (sa:dk:sn)", value=saniye_to_hhmmss(mevcut_sn), key=f"sure_{ad}_{tarih_str}")
                             st.markdown("---")
+                            sure_sn_parsed = hhmmss_to_saniye(sure_metin)
+                            if sure_sn_parsed is None:
+                                sure_hatali.append(ad)
+                                sure_sn_parsed = 0
                             girisler.append({
                                 "Ad Soyad": ad, "Dahili": dahili, "Arama Sayisi": arama,
-                                "Arama Suresi Sn": sure_saat * 3600 + sure_dk * 60 + sure_sn,
+                                "Arama Suresi Sn": sure_sn_parsed,
                                 "Izin Durumu": izin_durumu,
                             })
 
@@ -502,9 +507,12 @@ if st.session_state.admin:
 
                 gonder = st.form_submit_button("💾 Tümünü Kaydet", type="primary", use_container_width=True)
                 if gonder:
-                    bulk_upsert_kayitlar(tarih_str, girisler)
-                    st.success(f"{len(girisler)} kişinin verisi tek seferde kaydedildi.")
-                    st.rerun()
+                    if sure_hatali:
+                        st.error("Şu kişilerin 'Arama Süresi' alanı sa:dk:sn formatında değil (örn. 2:13:26): " + ", ".join(sure_hatali) + ". Lütfen düzeltip tekrar kaydedin.")
+                    else:
+                        bulk_upsert_kayitlar(tarih_str, girisler)
+                        st.success(f"{len(girisler)} kişinin verisi tek seferde kaydedildi.")
+                        st.rerun()
 
     # ---------------- TAB 2: BIRIM YONETIMI ----------------
     with tab2:
