@@ -59,7 +59,13 @@ def load_df(sheet_name, headers_tuple):
     data = ws.get_all_records()
     if not data:
         return pd.DataFrame(columns=list(headers_tuple))
-    return pd.DataFrame(data)
+    df = pd.DataFrame(data)
+    # E-tabloda henuz olmayan (sonradan eklenen) sutunlar icin bos deger ile tamamla,
+    # boylece sema guncellemeleri eski verilerle KeyError vermeden calisir.
+    for c in headers_tuple:
+        if c not in df.columns:
+            df[c] = ""
+    return df
 
 
 def overwrite_sheet(sheet_name, headers, df):
@@ -77,11 +83,11 @@ def overwrite_sheet(sheet_name, headers, df):
 UYELER_HEADERS = ["Ad Soyad", "Dahili", "Birim"]
 KAYITLAR_HEADERS = [
     "Tarih", "Ad Soyad", "Dahili",
-    "Arama Sayisi", "Arama Suresi Dk", "Depozit", "Dep Adet",
+    "Arama Sayisi", "Arama Suresi Dk", "Arama Suresi Sn", "Depozit", "Dep Adet",
     "Ek Sure Dk", "Zoiper Sure Dk", "Toplam Dk", "Izin Durumu",
 ]
 IZIN_SECENEKLERI = ["Yok", "Tam Gün İzinli", "Yarım Gün İzinli"]
-SAYISAL_KOLONLAR = ["Arama Sayisi", "Arama Suresi Dk", "Depozit", "Dep Adet", "Ek Sure Dk", "Zoiper Sure Dk", "Toplam Dk"]
+SAYISAL_KOLONLAR = ["Arama Sayisi", "Arama Suresi Dk", "Arama Suresi Sn", "Depozit", "Dep Adet", "Ek Sure Dk", "Zoiper Sure Dk", "Toplam Dk"]
 
 
 def load_uyeler():
@@ -112,15 +118,21 @@ def bulk_upsert_kayitlar(tarih, kayit_listesi):
     df = load_kayitlar()
     yeni_satirlar = []
     for k in kayit_listesi:
-        arama_suresi = int(k.get("Arama Suresi Dk", 0))
+        # Arama süresi artık saniye hassasiyetiyle tutulur (h:mm:ss). "Arama Suresi Dk"
+        # sadece Toplam Dk / Ortalama Rapor gibi dakika bazlı toplamlar için türetilir
+        # (saniye kalırsa yukarı yuvarlanır); ekranda gösterilen ve sıralamada kullanılan
+        # asıl değer "Arama Suresi Sn"dir.
+        arama_saniye = int(k.get("Arama Suresi Sn", 0))
+        arama_suresi_dk = arama_saniye // 60 + (1 if arama_saniye % 60 else 0)
         ek = int(k.get("Ek Sure Dk", 0))
         zoiper = int(k.get("Zoiper Sure Dk", 0))
         izin = k.get("Izin Durumu", "Yok")
-        toplam = 0 if izin == "Tam Gün İzinli" else (arama_suresi + ek + zoiper)
+        toplam = 0 if izin == "Tam Gün İzinli" else (arama_suresi_dk + ek + zoiper)
         yeni_satirlar.append({
             "Tarih": tarih, "Ad Soyad": k["Ad Soyad"], "Dahili": str(k.get("Dahili", "")),
             "Arama Sayisi": int(k.get("Arama Sayisi", 0)),
-            "Arama Suresi Dk": arama_suresi,
+            "Arama Suresi Dk": arama_suresi_dk,
+            "Arama Suresi Sn": arama_saniye,
             "Depozit": int(k.get("Depozit", 0)),
             "Dep Adet": int(k.get("Dep Adet", 0)),
             "Ek Sure Dk": ek, "Zoiper Sure Dk": zoiper,
@@ -136,20 +148,39 @@ def bulk_upsert_kayitlar(tarih, kayit_listesi):
 
 
 # ----------------------------------------------------------------------------------
-# YARDIMCI: SAAT:DK:SN -> DK CEVIRME (SANIYE VARSA YUKARI YUVARLA)
+# YARDIMCI: SAAT:DK:SN <-> SANIYE (ARAMA SURESI ARTIK SN HASSASIYETIYLE TUTULUR)
 # ----------------------------------------------------------------------------------
-def hhmmss_to_dk(s):
+def hhmmss_to_saniye(s):
+    """'2:13:26' / '03:15:51' gibi bir metni toplam saniyeye çevirir."""
     try:
-        parts = [int(p) for p in s.strip().split(":")]
+        parts = [int(p) for p in str(s).strip().split(":")]
         while len(parts) < 3:
             parts.insert(0, 0)
         h, m, sec = parts
-        total = h * 60 + m
-        if sec > 0:
-            total += 1
-        return total
+        return h * 3600 + m * 60 + sec
     except Exception:
         return None
+
+
+def saniye_to_hhmmss(sn):
+    """Toplam saniyeyi 'H:MM:SS' metnine çevirir (görüntülemede kullanılır, dakikaya yuvarlamaz)."""
+    try:
+        sn = int(sn)
+    except Exception:
+        sn = 0
+    if sn < 0:
+        sn = 0
+    h, kalan = divmod(sn, 3600)
+    m, s = divmod(kalan, 60)
+    return f"{h}:{m:02d}:{s:02d}"
+
+
+def hhmmss_to_dk(s):
+    """Geriye dönük uyumluluk için: h:mm:ss -> dakika (saniye kalırsa yukarı yuvarlar)."""
+    sn = hhmmss_to_saniye(s)
+    if sn is None:
+        return None
+    return sn // 60 + (1 if sn % 60 else 0)
 
 
 def parse_block(text, deger_kolonu):
@@ -176,7 +207,8 @@ def satis_hesapla_minmax(df):
     aktif = df[df["Izin Durumu"] == "Yok"]
     if aktif.empty:
         return None, None
-    return aktif["Arama Süresi (dk)"].min(), aktif["Arama Süresi (dk)"].max()
+    sn = aktif["Arama Süresi"].apply(hhmmss_to_saniye)
+    return sn.min(), sn.max()
 
 
 def satis_rengi(row, min_val, max_val):
@@ -185,9 +217,10 @@ def satis_rengi(row, min_val, max_val):
     if row["Izin Durumu"] == "Yarım Gün İzinli":
         return "#D8B4FE"
     if min_val is not None and max_val is not None and min_val != max_val:
-        if row["Arama Süresi (dk)"] == max_val:
+        sn = hhmmss_to_saniye(row["Arama Süresi"])
+        if sn == max_val:
             return "#90EE90"
-        if row["Arama Süresi (dk)"] == min_val:
+        if sn == min_val:
             return "#FF6B6B"
     return "#FFFFFF"
 
@@ -195,9 +228,10 @@ def satis_rengi(row, min_val, max_val):
 def satis_notu(row, min_val, max_val, emoji=True):
     if row["Izin Durumu"] != "Yok" or min_val is None or max_val is None or min_val == max_val:
         return ""
-    if row["Arama Süresi (dk)"] == max_val:
+    sn = hhmmss_to_saniye(row["Arama Süresi"])
+    if sn == max_val:
         return ("🎉 " if emoji else "★ ") + "EN YÜKSEK ARAMA SÜRESİ"
-    if row["Arama Süresi (dk)"] == min_val:
+    if sn == min_val:
         return ("🚨 " if emoji else "⚠ ") + "EN DÜŞÜK ARAMA SÜRESİ"
     return ""
 
@@ -215,7 +249,8 @@ def retler_hesapla_minmax(df):
     aktif = df[df["Izin Durumu"] == "Yok"]
     if aktif.empty:
         return None, None, None, None
-    return aktif["Depozit"].min(), aktif["Depozit"].max(), aktif["Arama Süresi (dk)"].min(), aktif["Arama Süresi (dk)"].max()
+    sn = aktif["Arama Süresi"].apply(hhmmss_to_saniye)
+    return aktif["Depozit"].min(), aktif["Depozit"].max(), sn.min(), sn.max()
 
 
 def retler_rengi(row, dep_min, dep_max):
@@ -234,7 +269,7 @@ def retler_notu(row, dep_min, dep_max, sure_min, sure_max, emoji=True):
     parcalar = []
     if dep_min is not None and dep_max is not None and dep_min != dep_max and row["Depozit"] == dep_max:
         parcalar.append(("💰 " if emoji else "$ ") + "EN YÜKSEK DEPOZİT")
-    if sure_min is not None and sure_max is not None and sure_min != sure_max and row["Arama Süresi (dk)"] == sure_max:
+    if sure_min is not None and sure_max is not None and sure_min != sure_max and hhmmss_to_saniye(row["Arama Süresi"]) == sure_max:
         parcalar.append(("⏱️ " if emoji else "* ") + "EN YÜKSEK ARAMA SÜRESİ")
     return " | ".join(parcalar)
 
@@ -289,24 +324,24 @@ def build_image(baslik, columns, col_widths, satirlar):
 
 
 def build_satis_image(tarih_str, df, min_val, max_val):
-    columns = ["İsim Soyisim", "Dahili", "Arama Sayısı", "Arama Süresi (dk)", "İzin Durumu", "Not"]
+    columns = ["İsim Soyisim", "Dahili", "Arama Sayısı", "Arama Süresi", "İzin Durumu", "Not"]
     satirlar = []
     for _, r in df.iterrows():
         renk = satis_rengi(r, min_val, max_val)
         not_metni = satis_notu(r, min_val, max_val, emoji=False)
-        metinler = [str(r["İsim Soyisim"]), str(r["Dahili"]), str(r["Arama Sayısı"]), str(r["Arama Süresi (dk)"]), str(r["Izin Durumu"]), not_metni]
+        metinler = [str(r["İsim Soyisim"]), str(r["Dahili"]), str(r["Arama Sayısı"]), str(r["Arama Süresi"]), str(r["Izin Durumu"]), not_metni]
         satirlar.append((metinler, [renk] * len(columns), False))
     return build_image(f"{tarih_str} — Satış Ekibi", columns, [0.20, 0.10, 0.14, 0.16, 0.15, 0.25], satirlar)
 
 
 def build_retler_image(tarih_str, df, dep_min, dep_max, sure_min, sure_max):
-    columns = ["İsim Soyisim", "Dahili", "Arama Sayısı", "Arama Süresi (dk)", "Depozit", "Dep Adet", "İzin Durumu", "Not"]
+    columns = ["İsim Soyisim", "Dahili", "Arama Sayısı", "Arama Süresi", "Depozit", "Dep Adet", "İzin Durumu", "Not"]
     satirlar = []
     for _, r in df.iterrows():
         renk = retler_rengi(r, dep_min, dep_max)
         not_metni = retler_notu(r, dep_min, dep_max, sure_min, sure_max, emoji=False)
         metinler = [
-            str(r["İsim Soyisim"]), str(r["Dahili"]), str(r["Arama Sayısı"]), str(r["Arama Süresi (dk)"]),
+            str(r["İsim Soyisim"]), str(r["Dahili"]), str(r["Arama Sayısı"]), str(r["Arama Süresi"]),
             str(r["Depozit"]), str(r["Dep Adet"]), str(r["Izin Durumu"]), not_metni,
         ]
         satirlar.append((metinler, [renk] * len(columns), False))
@@ -314,7 +349,7 @@ def build_retler_image(tarih_str, df, dep_min, dep_max, sure_min, sure_max):
 
 
 # ----------------------------------------------------------------------------------
-# YARDIMCI: ORTALAMA RAPOR (HAFTASONU VE TAM GUN IZIN HARIC)
+# YARDIMCI: ORTALAMA RAPOR (TUM GUNLER DAHIL, SADECE TAM GUN IZIN HARIC)
 # ----------------------------------------------------------------------------------
 def ortalama_rapor(kayitlar_df, uyeler_df, baslangic, bitis):
     if kayitlar_df.empty or uyeler_df.empty:
@@ -323,7 +358,6 @@ def ortalama_rapor(kayitlar_df, uyeler_df, baslangic, bitis):
     df = kayitlar_df.copy()
     df["Tarih_dt"] = pd.to_datetime(df["Tarih"], errors="coerce")
     df = df[(df["Tarih_dt"].dt.date >= baslangic) & (df["Tarih_dt"].dt.date <= bitis)]
-    df = df[df["Tarih_dt"].dt.weekday < 5]  # haftasonlarini cikar
     df = df[df["Izin Durumu"] != "Tam Gün İzinli"]  # tam gun izinli gunleri tamamen cikar
 
     if df.empty:
@@ -411,32 +445,43 @@ if st.session_state.admin:
                         mevcut_izin = m["Izin Durumu"] if m is not None and "Izin Durumu" in m else "Yok"
                         izin_idx = IZIN_SECENEKLERI.index(mevcut_izin) if mevcut_izin in IZIN_SECENEKLERI else 0
 
+                        # Arama süresini h:mm:ss olarak saklıyoruz; eski kayıtlarda "Arama Suresi Sn"
+                        # yoksa "Arama Suresi Dk"dan (saniyesiz) türetilir.
+                        if m is not None and "Arama Suresi Sn" in m and pd.notna(m["Arama Suresi Sn"]) and int(m["Arama Suresi Sn"]) > 0:
+                            mevcut_sn = int(m["Arama Suresi Sn"])
+                        elif m is not None:
+                            mevcut_sn = int(m["Arama Suresi Dk"]) * 60
+                        else:
+                            mevcut_sn = 0
+
                         if birim == "Retler":
-                            c0, c1, c2, c3, c4, c5 = st.columns([1.2, 1, 1, 1, 1, 1])
+                            c0, c1, c2, c3, c4, c5, c6 = st.columns([1.1, 0.9, 0.7, 0.7, 0.7, 0.9, 0.9])
                             izin_durumu = c0.selectbox("İzin Durumu", IZIN_SECENEKLERI, index=izin_idx, key=f"izin_{ad}_{tarih_str}")
                             arama = c1.number_input("Arama Sayısı", min_value=0, value=int(m["Arama Sayisi"]) if m is not None else 0, key=f"arama_{ad}_{tarih_str}")
-                            sure_saat = c2.number_input("Arama Süresi Saat", min_value=0, value=int(m["Arama Suresi Dk"]) // 60 if m is not None else 0, key=f"suresaat_{ad}_{tarih_str}")
-                            sure_dk = c3.number_input("Arama Süresi Dk", min_value=0, max_value=59, value=int(m["Arama Suresi Dk"]) % 60 if m is not None else 0, key=f"suredk_{ad}_{tarih_str}")
-                            depozit = c4.number_input("Depozit", min_value=0, value=int(m["Depozit"]) if m is not None else 0, key=f"depozit_{ad}_{tarih_str}")
-                            dep_adet = c5.number_input("Dep Adet", min_value=0, value=int(m["Dep Adet"]) if m is not None else 0, key=f"depadet_{ad}_{tarih_str}")
+                            sure_saat = c2.number_input("Süre Saat", min_value=0, value=mevcut_sn // 3600, key=f"suresaat_{ad}_{tarih_str}")
+                            sure_dk = c3.number_input("Süre Dk", min_value=0, max_value=59, value=(mevcut_sn % 3600) // 60, key=f"suredk_{ad}_{tarih_str}")
+                            sure_sn = c4.number_input("Süre Sn", min_value=0, max_value=59, value=mevcut_sn % 60, key=f"suresn_{ad}_{tarih_str}")
+                            depozit = c5.number_input("Depozit", min_value=0, value=int(m["Depozit"]) if m is not None else 0, key=f"depozit_{ad}_{tarih_str}")
+                            dep_adet = c6.number_input("Dep Adet", min_value=0, value=int(m["Dep Adet"]) if m is not None else 0, key=f"depadet_{ad}_{tarih_str}")
                             st.markdown("---")
                             girisler.append({
                                 "Ad Soyad": ad, "Dahili": dahili, "Arama Sayisi": arama,
-                                "Arama Suresi Dk": sure_saat * 60 + sure_dk,
+                                "Arama Suresi Sn": sure_saat * 3600 + sure_dk * 60 + sure_sn,
                                 "Depozit": depozit, "Dep Adet": dep_adet,
                                 "Izin Durumu": izin_durumu,
                             })
 
                         elif birim == "Satış Ekibi":
-                            c0, c1, c2, c3 = st.columns([1.2, 1, 1, 1])
+                            c0, c1, c2, c3, c4 = st.columns([1.2, 1, 0.8, 0.8, 0.8])
                             izin_durumu = c0.selectbox("İzin Durumu", IZIN_SECENEKLERI, index=izin_idx, key=f"izin_{ad}_{tarih_str}")
                             arama = c1.number_input("Arama Sayısı", min_value=0, value=int(m["Arama Sayisi"]) if m is not None else 0, key=f"arama_{ad}_{tarih_str}")
-                            sure_saat = c2.number_input("Arama Süresi Saat", min_value=0, value=int(m["Arama Suresi Dk"]) // 60 if m is not None else 0, key=f"suresaat_{ad}_{tarih_str}")
-                            sure_dk = c3.number_input("Arama Süresi Dk", min_value=0, max_value=59, value=int(m["Arama Suresi Dk"]) % 60 if m is not None else 0, key=f"suredk_{ad}_{tarih_str}")
+                            sure_saat = c2.number_input("Süre Saat", min_value=0, value=mevcut_sn // 3600, key=f"suresaat_{ad}_{tarih_str}")
+                            sure_dk = c3.number_input("Süre Dk", min_value=0, max_value=59, value=(mevcut_sn % 3600) // 60, key=f"suredk_{ad}_{tarih_str}")
+                            sure_sn = c4.number_input("Süre Sn", min_value=0, max_value=59, value=mevcut_sn % 60, key=f"suresn_{ad}_{tarih_str}")
                             st.markdown("---")
                             girisler.append({
                                 "Ad Soyad": ad, "Dahili": dahili, "Arama Sayisi": arama,
-                                "Arama Suresi Dk": sure_saat * 60 + sure_dk,
+                                "Arama Suresi Sn": sure_saat * 3600 + sure_dk * 60 + sure_sn,
                                 "Izin Durumu": izin_durumu,
                             })
 
@@ -482,7 +527,7 @@ if st.session_state.admin:
     # ---------------- TAB 3: AYRISTIRMA ----------------
     with tab3:
         st.subheader("Otomatik Ayrıştırma")
-        st.caption("İki farklı listeyi (Adet ve Süre raporları) aşağıya yapıştırın. Sistem 'MERKEZ' ibaresini kaldırır, süreleri dakikaya çevirir (saniye kalırsa yukarı yuvarlar) ve Dahili numarasına göre eşleştirir. Sonuç 'Arama Süresi' alanına yazılır; Retler için Depozit/Dep Adet'i ve birimi elle tamamlamanız gerekir.")
+        st.caption("İki farklı listeyi (Adet ve Süre raporları) aşağıya yapıştırın. Sistem 'MERKEZ' ibaresini kaldırır ve Dahili numarasına göre eşleştirir. Süre, dakikaya çevrilmeden yapıştırıldığı gibi (saat:dk:sn) 'Süre' alanına yazılır; Retler için Depozit/Dep Adet'i ve birimi elle tamamlamanız gerekir.")
         c1, c2 = st.columns(2)
         with c1:
             blok_adet = st.text_area("Arama Sayısı Listesi (Site Adet Dahili Ad Soyad)", height=300, placeholder="MERKEZ 242 4004 DOGUKAN BASARAN")
@@ -492,18 +537,19 @@ if st.session_state.admin:
         if st.button("Ayrıştır"):
             df_adet = parse_block(blok_adet, "Arama Sayısı")
             df_sure = parse_block(blok_sure, "Süre")
-            if not df_sure.empty:
-                df_sure["Arama Süresi (dk)"] = df_sure["Süre"].apply(hhmmss_to_dk)
             merged = pd.merge(
                 df_adet[["Dahili", "Ad Soyad", "Arama Sayısı"]] if not df_adet.empty else pd.DataFrame(columns=["Dahili", "Ad Soyad", "Arama Sayısı"]),
-                df_sure[["Dahili", "Arama Süresi (dk)"]] if not df_sure.empty else pd.DataFrame(columns=["Dahili", "Arama Süresi (dk)"]),
+                df_sure[["Dahili", "Süre"]] if not df_sure.empty else pd.DataFrame(columns=["Dahili", "Süre"]),
                 on="Dahili", how="outer",
             )
             if not df_sure.empty:
                 ad_map = dict(zip(df_sure["Dahili"], df_sure["Ad Soyad"]))
                 merged["Ad Soyad"] = merged.apply(lambda r: r["Ad Soyad"] if pd.notna(r["Ad Soyad"]) else ad_map.get(r["Dahili"], ""), axis=1)
             merged["Arama Sayısı"] = pd.to_numeric(merged["Arama Sayısı"], errors="coerce").fillna(0).astype(int)
-            merged["Arama Süresi (dk)"] = pd.to_numeric(merged["Arama Süresi (dk)"], errors="coerce").fillna(0).astype(int)
+            merged["Süre"] = merged["Süre"].fillna("0:00:00")
+            # Sıralama/onay için saniyeye çevrilir, ama ekranda hep "Süre" (h:mm:ss) yazıldığı gibi kalır
+            merged["_ArSureSn"] = merged["Süre"].apply(hhmmss_to_saniye).fillna(0).astype(int)
+            merged = merged.sort_values("_ArSureSn", ascending=False).drop(columns=["_ArSureSn"]).reset_index(drop=True)
             merged["Depozit"] = 0
             merged["Dep Adet"] = 0
             merged["Izin Durumu"] = "Yok"
@@ -536,7 +582,8 @@ if st.session_state.admin:
                 kayit_listesi = [
                     {
                         "Ad Soyad": r["Ad Soyad"], "Dahili": str(r["Dahili"]),
-                        "Arama Sayisi": r["Arama Sayısı"], "Arama Suresi Dk": r["Arama Süresi (dk)"],
+                        "Arama Sayisi": r["Arama Sayısı"],
+                        "Arama Suresi Sn": hhmmss_to_saniye(r.get("Süre", "0:00:00")) or 0,
                         "Depozit": r.get("Depozit", 0), "Dep Adet": r.get("Dep Adet", 0),
                         "Izin Durumu": r.get("Izin Durumu", "Yok"),
                     }
@@ -572,8 +619,11 @@ else:
     # ---------------- RETLER ----------------
     retler_df = hazirla("Retler")
     if retler_df is not None:
-        gosterim = retler_df.rename(columns={"Ad Soyad": "İsim Soyisim", "Arama Sayisi": "Arama Sayısı", "Arama Suresi Dk": "Arama Süresi (dk)"})
-        gosterim = gosterim[["İsim Soyisim", "Dahili", "Arama Sayısı", "Arama Süresi (dk)", "Depozit", "Dep Adet", "Izin Durumu"]]
+        gosterim = retler_df.rename(columns={"Ad Soyad": "İsim Soyisim", "Arama Sayisi": "Arama Sayısı"})
+        gosterim["Arama Süresi"] = gosterim["Arama Suresi Sn"].apply(saniye_to_hhmmss)
+        gosterim = gosterim[["İsim Soyisim", "Dahili", "Arama Sayısı", "Arama Süresi", "Depozit", "Dep Adet", "Izin Durumu"]]
+        gosterim["_sn"] = gosterim["Arama Süresi"].apply(hhmmss_to_saniye)
+        gosterim = gosterim.sort_values("_sn", ascending=False).drop(columns=["_sn"]).reset_index(drop=True)
         dep_min, dep_max, sure_min, sure_max = retler_hesapla_minmax(gosterim)
         gosterim["Not"] = gosterim.apply(lambda r: retler_notu(r, dep_min, dep_max, sure_min, sure_max, emoji=True), axis=1)
         st.markdown("#### Retler")
@@ -591,8 +641,11 @@ else:
     # ---------------- SATIŞ EKİBİ ----------------
     satis_df = hazirla("Satış Ekibi")
     if satis_df is not None:
-        gosterim = satis_df.rename(columns={"Ad Soyad": "İsim Soyisim", "Arama Sayisi": "Arama Sayısı", "Arama Suresi Dk": "Arama Süresi (dk)"})
-        gosterim = gosterim[["İsim Soyisim", "Dahili", "Arama Sayısı", "Arama Süresi (dk)", "Izin Durumu"]]
+        gosterim = satis_df.rename(columns={"Ad Soyad": "İsim Soyisim", "Arama Sayisi": "Arama Sayısı"})
+        gosterim["Arama Süresi"] = gosterim["Arama Suresi Sn"].apply(saniye_to_hhmmss)
+        gosterim = gosterim[["İsim Soyisim", "Dahili", "Arama Sayısı", "Arama Süresi", "Izin Durumu"]]
+        gosterim["_sn"] = gosterim["Arama Süresi"].apply(hhmmss_to_saniye)
+        gosterim = gosterim.sort_values("_sn", ascending=False).drop(columns=["_sn"]).reset_index(drop=True)
         min_val, max_val = satis_hesapla_minmax(gosterim)
         gosterim["Not"] = gosterim.apply(lambda r: satis_notu(r, min_val, max_val, emoji=True), axis=1)
         st.markdown("#### Satış Ekibi")
@@ -635,7 +688,7 @@ else:
 # ----------------------------------------------------------------------------------
 st.markdown("---")
 st.subheader("📈 Ortalama Rapor (Tarih Aralığı)")
-st.caption("Seçilen tarih aralığındaki hafta içi günlerin ortalaması alınır. Hafta sonları ve kişinin tam gün izinli olduğu günler hesaba katılmaz. Yarım gün izinli günler, o günün gerçek verisiyle hesaba dahil edilir.")
+st.caption("Seçilen tarih aralığındaki tüm günlerin (hafta sonu dahil) ortalaması alınır. Sadece kişinin tam gün izinli olduğu günler hesaba katılmaz. Yarım gün izinli günler, o günün gerçek verisiyle hesaba dahil edilir.")
 
 rc1, rc2 = st.columns(2)
 r_baslangic = rc1.date_input("Başlangıç Tarihi", value=datetime.date.today() - datetime.timedelta(days=7), key="rapor_baslangic")
@@ -647,7 +700,7 @@ if st.button("Ortalama Raporu Oluştur"):
     else:
         rapor = ortalama_rapor(kayitlar, uyeler, r_baslangic, r_bitis)
         if rapor.empty:
-            st.info("Seçilen aralıkta (hafta sonları ve tam gün izinler hariç) veri bulunamadı.")
+            st.info("Seçilen aralıkta (tam gün izinler hariç) veri bulunamadı.")
         else:
             for birim in BIRIMLER + ["Atanmamış"]:
                 grup = rapor[rapor["Birim"] == birim] if birim != "Atanmamış" else rapor[~rapor["Birim"].isin(BIRIMLER)]
