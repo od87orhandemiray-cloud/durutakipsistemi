@@ -12,7 +12,6 @@ import matplotlib.pyplot as plt
 # AYARLAR
 # ----------------------------------------------------------------------------------
 BIRIMLER = ["Retler", "Teknik Birim", "Satış Ekibi"]
-RENK_SKALASI_UYGULANAN_BIRIMLER = ["Retler", "Satış Ekibi"]  # Teknik Birim'e renk skalası (en yüksek/en düşük/120dk) uygulanmaz
 UYELER_SHEET = "Uyeler"
 KAYITLAR_SHEET = "Kayitlar"
 
@@ -76,8 +75,13 @@ def overwrite_sheet(sheet_name, headers, df):
 # VERI KATMANI
 # ----------------------------------------------------------------------------------
 UYELER_HEADERS = ["Ad Soyad", "Dahili", "Birim"]
-KAYITLAR_HEADERS = ["Tarih", "Ad Soyad", "Dahili", "Arama Sayisi", "Ek Sure Dk", "Zoiper Sure Dk", "Toplam Dk", "Izin Durumu"]
+KAYITLAR_HEADERS = [
+    "Tarih", "Ad Soyad", "Dahili",
+    "Arama Sayisi", "Arama Suresi Dk", "Depozit", "Dep Adet",
+    "Ek Sure Dk", "Zoiper Sure Dk", "Toplam Dk", "Izin Durumu",
+]
 IZIN_SECENEKLERI = ["Yok", "Tam Gün İzinli", "Yarım Gün İzinli"]
+SAYISAL_KOLONLAR = ["Arama Sayisi", "Arama Suresi Dk", "Depozit", "Dep Adet", "Ek Sure Dk", "Zoiper Sure Dk", "Toplam Dk"]
 
 
 def load_uyeler():
@@ -96,30 +100,32 @@ def load_kayitlar():
     df = load_df(KAYITLAR_SHEET, tuple(KAYITLAR_HEADERS))
     if df.empty:
         return df
-    for c in ["Arama Sayisi", "Ek Sure Dk", "Zoiper Sure Dk", "Toplam Dk"]:
+    for c in SAYISAL_KOLONLAR:
         df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).astype(int)
     df["Dahili"] = df["Dahili"].astype(str)
     return df
 
 
-def upsert_kayit(tarih, ad_soyad, dahili, arama, ek_dk, zoiper_dk, izin_durumu):
-    bulk_upsert_kayitlar(tarih, [{
-        "Ad Soyad": ad_soyad, "Dahili": dahili, "Arama Sayisi": arama,
-        "Ek Sure Dk": ek_dk, "Zoiper Sure Dk": zoiper_dk, "Izin Durumu": izin_durumu,
-    }])
-
-
 def bulk_upsert_kayitlar(tarih, kayit_listesi):
-    """Birden fazla kişinin o günkü kaydını TEK bir okuma + TEK bir yazma isteğiyle günceller."""
+    """Birden fazla kişinin o günkü kaydını TEK bir okuma + TEK bir yazma isteğiyle günceller.
+    Her kayıt sözlüğü, ilgili birime göre yalnızca kullandığı alanları doldurur; diğerleri 0 kalır."""
     df = load_kayitlar()
     yeni_satirlar = []
     for k in kayit_listesi:
-        toplam = 0 if k["Izin Durumu"] == "Tam Gün İzinli" else (int(k["Ek Sure Dk"]) + int(k["Zoiper Sure Dk"]))
+        arama_suresi = int(k.get("Arama Suresi Dk", 0))
+        ek = int(k.get("Ek Sure Dk", 0))
+        zoiper = int(k.get("Zoiper Sure Dk", 0))
+        izin = k.get("Izin Durumu", "Yok")
+        toplam = 0 if izin == "Tam Gün İzinli" else (arama_suresi + ek + zoiper)
         yeni_satirlar.append({
-            "Tarih": tarih, "Ad Soyad": k["Ad Soyad"], "Dahili": str(k["Dahili"]),
-            "Arama Sayisi": int(k["Arama Sayisi"]), "Ek Sure Dk": int(k["Ek Sure Dk"]),
-            "Zoiper Sure Dk": int(k["Zoiper Sure Dk"]), "Toplam Dk": int(toplam),
-            "Izin Durumu": k["Izin Durumu"],
+            "Tarih": tarih, "Ad Soyad": k["Ad Soyad"], "Dahili": str(k.get("Dahili", "")),
+            "Arama Sayisi": int(k.get("Arama Sayisi", 0)),
+            "Arama Suresi Dk": arama_suresi,
+            "Depozit": int(k.get("Depozit", 0)),
+            "Dep Adet": int(k.get("Dep Adet", 0)),
+            "Ek Sure Dk": ek, "Zoiper Sure Dk": zoiper,
+            "Toplam Dk": int(toplam),
+            "Izin Durumu": izin,
         })
     isimler = [s["Ad Soyad"] for s in yeni_satirlar]
     if not df.empty:
@@ -164,118 +170,147 @@ def parse_block(text, deger_kolonu):
 
 
 # ----------------------------------------------------------------------------------
-# YARDIMCI: RENKLENDIRME VE ETIKETLEME
+# YARDIMCI: SATIS EKIBI RENKLENDIRME (SADECE EN YUKSEK / EN DUSUK ARAMA SURESI)
 # ----------------------------------------------------------------------------------
-def hesapla_minmax(df, apply_minmax):
-    if not apply_minmax:
-        return None, None
+def satis_hesapla_minmax(df):
     aktif = df[df["Izin Durumu"] == "Yok"]
     if aktif.empty:
         return None, None
-    return aktif["Toplam Dk"].min(), aktif["Toplam Dk"].max()
+    return aktif["Arama Süresi (dk)"].min(), aktif["Arama Süresi (dk)"].max()
 
 
-def satir_rengi(row, apply_minmax, min_val, max_val):
+def satis_rengi(row, min_val, max_val):
     if row["Izin Durumu"] == "Tam Gün İzinli":
         return "#7FDBFF"
     if row["Izin Durumu"] == "Yarım Gün İzinli":
         return "#D8B4FE"
-    if apply_minmax and min_val is not None and max_val is not None and min_val != max_val:
-        if row["Toplam Dk"] == max_val:
+    if min_val is not None and max_val is not None and min_val != max_val:
+        if row["Arama Süresi (dk)"] == max_val:
             return "#90EE90"
-        if row["Toplam Dk"] == min_val:
+        if row["Arama Süresi (dk)"] == min_val:
             return "#FF6B6B"
-    if apply_minmax and row["Toplam Dk"] < 120:
-        return "#FFEB3B"
     return "#FFFFFF"
 
 
-def satir_notu(row, apply_minmax, min_val, max_val, emoji=True):
-    if not apply_minmax or min_val is None or max_val is None or min_val == max_val:
+def satis_notu(row, min_val, max_val, emoji=True):
+    if row["Izin Durumu"] != "Yok" or min_val is None or max_val is None or min_val == max_val:
         return ""
-    if row["Izin Durumu"] != "Yok":
-        return ""
-    if row["Toplam Dk"] == max_val:
-        return ("🎉 " if emoji else "★ ") + "EN YÜKSEK GÖRÜŞME SÜRESİ"
-    if row["Toplam Dk"] == min_val:
+    if row["Arama Süresi (dk)"] == max_val:
+        return ("🎉 " if emoji else "★ ") + "EN YÜKSEK ARAMA SÜRESİ"
+    if row["Arama Süresi (dk)"] == min_val:
         return ("🚨 " if emoji else "⚠ ") + "EN DÜŞÜK ARAMA SÜRESİ"
     return ""
 
 
-def style_table(df, apply_minmax=True):
-    min_val, max_val = hesapla_minmax(df, apply_minmax)
-    return style_table_with_minmax(df, apply_minmax, min_val, max_val)
-
-
-def style_table_with_minmax(df, apply_minmax, min_val, max_val):
+def satis_style(df, min_val, max_val):
     def row_style(row):
-        renk = satir_rengi(row, apply_minmax, min_val, max_val)
-        return [f"background-color: {renk}"] * len(row)
-
+        return [f"background-color: {satis_rengi(row, min_val, max_val)}"] * len(row)
     return df.style.apply(row_style, axis=1)
 
 
 # ----------------------------------------------------------------------------------
-# YARDIMCI: PNG GORSEL OLUSTURMA
+# YARDIMCI: RETLER RENKLENDIRME (EN YUKSEK DEPOZIT = YESIL, EN YUKSEK SURE = SADECE IBARE)
 # ----------------------------------------------------------------------------------
-def build_table_image(tarih_str, gruplar):
-    columns = ["İsim Soyisim", "Arama Sayısı", "Ek Süre (dk)", "Zoiper Süre (dk)", "Toplam Dk", "İzin Durumu", "Not"]
-    cell_text, cell_colors, text_colors = [], [], []
-    baslik_satirlari = set()
-    row_i = 0
+def retler_hesapla_minmax(df):
+    aktif = df[df["Izin Durumu"] == "Yok"]
+    if aktif.empty:
+        return None, None, None, None
+    return aktif["Depozit"].min(), aktif["Depozit"].max(), aktif["Arama Süresi (dk)"].min(), aktif["Arama Süresi (dk)"].max()
 
-    for birim, df, apply_minmax, min_val, max_val in gruplar:
-        if df.empty:
-            continue
-        cell_text.append([birim] + [""] * (len(columns) - 1))
-        cell_colors.append(["#374151"] * len(columns))
-        text_colors.append(["white"] * len(columns))
-        baslik_satirlari.add(row_i)
-        row_i += 1
 
-        cell_text.append(columns)
-        cell_colors.append(["#E5E7EB"] * len(columns))
-        text_colors.append(["#111827"] * len(columns))
-        baslik_satirlari.add(row_i)
-        row_i += 1
+def retler_rengi(row, dep_min, dep_max):
+    if row["Izin Durumu"] == "Tam Gün İzinli":
+        return "#7FDBFF"
+    if row["Izin Durumu"] == "Yarım Gün İzinli":
+        return "#D8B4FE"
+    if dep_min is not None and dep_max is not None and dep_min != dep_max and row["Depozit"] == dep_max:
+        return "#90EE90"
+    return "#FFFFFF"
 
-        for _, r in df.iterrows():
-            renk = satir_rengi(r, apply_minmax, min_val, max_val)
-            not_metni = satir_notu(r, apply_minmax, min_val, max_val, emoji=False)
-            satir = [
-                str(r["İsim Soyisim"]), str(r["Arama Sayısı"]), str(r["Ek Süre (dk)"]),
-                str(r["Zoiper Süre (dk)"]), str(r["Toplam Dk"]), str(r["Izin Durumu"]), not_metni,
-            ]
-            cell_text.append(satir)
-            cell_colors.append([renk] * len(columns))
-            text_colors.append(["#111827"] * len(columns))
-            row_i += 1
 
-    if not cell_text:
-        return None
+def retler_notu(row, dep_min, dep_max, sure_min, sure_max, emoji=True):
+    if row["Izin Durumu"] != "Yok":
+        return ""
+    parcalar = []
+    if dep_min is not None and dep_max is not None and dep_min != dep_max and row["Depozit"] == dep_max:
+        parcalar.append(("💰 " if emoji else "$ ") + "EN YÜKSEK DEPOZİT")
+    if sure_min is not None and sure_max is not None and sure_min != sure_max and row["Arama Süresi (dk)"] == sure_max:
+        parcalar.append(("⏱️ " if emoji else "* ") + "EN YÜKSEK ARAMA SÜRESİ")
+    return " | ".join(parcalar)
 
-    fig_height = max(2, len(cell_text) * 0.38 + 0.6)
-    fig, ax = plt.subplots(figsize=(13, fig_height))
+
+def retler_style(df, dep_min, dep_max):
+    def row_style(row):
+        return [f"background-color: {retler_rengi(row, dep_min, dep_max)}"] * len(row)
+    return df.style.apply(row_style, axis=1)
+
+
+# ----------------------------------------------------------------------------------
+# YARDIMCI: TEKNIK BIRIM (RENKSIZ, ESKI DUZEN)
+# ----------------------------------------------------------------------------------
+def teknik_style(df):
+    def row_style(row):
+        if row["Izin Durumu"] == "Tam Gün İzinli":
+            renk = "#7FDBFF"
+        elif row["Izin Durumu"] == "Yarım Gün İzinli":
+            renk = "#D8B4FE"
+        else:
+            renk = "#FFFFFF"
+        return [f"background-color: {renk}"] * len(row)
+    return df.style.apply(row_style, axis=1)
+
+
+# ----------------------------------------------------------------------------------
+# YARDIMCI: PNG GORSEL OLUSTURMA (GENEL AMACLI)
+# ----------------------------------------------------------------------------------
+def build_image(baslik, columns, col_widths, satirlar):
+    """satirlar: [(hucre_metinleri_listesi, hucre_renkleri_listesi, kalin_mi), ...]"""
+    cell_text = [columns] + [s[0] for s in satirlar]
+    cell_colors = [["#E5E7EB"] * len(columns)] + [s[1] for s in satirlar]
+    kalin_satirlar = {0}
+
+    fig_height = max(2, len(cell_text) * 0.4 + 0.7)
+    fig, ax = plt.subplots(figsize=(11, fig_height))
     ax.axis("off")
-    ax.set_title(f"{tarih_str} Tarihli Görüşme Tablosu", fontsize=15, fontweight="bold", loc="left")
-    tbl = ax.table(
-        cellText=cell_text, cellColours=cell_colors, loc="center", cellLoc="left",
-        colWidths=[0.17, 0.11, 0.11, 0.13, 0.11, 0.14, 0.23],
-    )
+    ax.set_title(baslik, fontsize=15, fontweight="bold", loc="left")
+    tbl = ax.table(cellText=cell_text, cellColours=cell_colors, loc="center", cellLoc="left", colWidths=col_widths)
     tbl.auto_set_font_size(False)
     tbl.set_fontsize(9)
-    tbl.scale(1, 1.6)
+    tbl.scale(1, 1.7)
     for (r, c), cell in tbl.get_celld().items():
         cell.set_edgecolor("#D1D5DB")
-        cell.PAD = 0.02
-        weight = "bold" if r in baslik_satirlari else "normal"
-        cell.set_text_props(weight=weight, color=text_colors[r][c])
+        cell.set_text_props(weight="bold" if r in kalin_satirlar else "normal", color="#111827")
 
     buf = BytesIO()
     plt.savefig(buf, format="png", dpi=200, bbox_inches="tight")
     plt.close(fig)
     buf.seek(0)
     return buf.getvalue()
+
+
+def build_satis_image(tarih_str, df, min_val, max_val):
+    columns = ["İsim Soyisim", "Dahili", "Arama Sayısı", "Arama Süresi (dk)", "İzin Durumu", "Not"]
+    satirlar = []
+    for _, r in df.iterrows():
+        renk = satis_rengi(r, min_val, max_val)
+        not_metni = satis_notu(r, min_val, max_val, emoji=False)
+        metinler = [str(r["İsim Soyisim"]), str(r["Dahili"]), str(r["Arama Sayısı"]), str(r["Arama Süresi (dk)"]), str(r["Izin Durumu"]), not_metni]
+        satirlar.append((metinler, [renk] * len(columns), False))
+    return build_image(f"{tarih_str} — Satış Ekibi", columns, [0.20, 0.10, 0.14, 0.16, 0.15, 0.25], satirlar)
+
+
+def build_retler_image(tarih_str, df, dep_min, dep_max, sure_min, sure_max):
+    columns = ["İsim Soyisim", "Dahili", "Arama Sayısı", "Arama Süresi (dk)", "Depozit", "Dep Adet", "İzin Durumu", "Not"]
+    satirlar = []
+    for _, r in df.iterrows():
+        renk = retler_rengi(r, dep_min, dep_max)
+        not_metni = retler_notu(r, dep_min, dep_max, sure_min, sure_max, emoji=False)
+        metinler = [
+            str(r["İsim Soyisim"]), str(r["Dahili"]), str(r["Arama Sayısı"]), str(r["Arama Süresi (dk)"]),
+            str(r["Depozit"]), str(r["Dep Adet"]), str(r["Izin Durumu"]), not_metni,
+        ]
+        satirlar.append((metinler, [renk] * len(columns), False))
+    return build_image(f"{tarih_str} — Retler", columns, [0.17, 0.09, 0.11, 0.13, 0.11, 0.11, 0.13, 0.25], satirlar)
 
 
 # ----------------------------------------------------------------------------------
@@ -288,10 +323,8 @@ def ortalama_rapor(kayitlar_df, uyeler_df, baslangic, bitis):
     df = kayitlar_df.copy()
     df["Tarih_dt"] = pd.to_datetime(df["Tarih"], errors="coerce")
     df = df[(df["Tarih_dt"].dt.date >= baslangic) & (df["Tarih_dt"].dt.date <= bitis)]
-    # haftasonlarini cikar (Cumartesi=5, Pazar=6)
-    df = df[df["Tarih_dt"].dt.weekday < 5]
-    # tam gun izinli gunleri o kisi icin hesaptan tamamen cikar
-    df = df[df["Izin Durumu"] != "Tam Gün İzinli"]
+    df = df[df["Tarih_dt"].dt.weekday < 5]  # haftasonlarini cikar
+    df = df[df["Izin Durumu"] != "Tam Gün İzinli"]  # tam gun izinli gunleri tamamen cikar
 
     if df.empty:
         return pd.DataFrame()
@@ -299,19 +332,23 @@ def ortalama_rapor(kayitlar_df, uyeler_df, baslangic, bitis):
     ozet = df.groupby("Ad Soyad").agg(
         Gun_Sayisi=("Tarih", "nunique"),
         Toplam_Arama=("Arama Sayisi", "sum"),
+        Toplam_Arama_Suresi=("Arama Suresi Dk", "sum"),
+        Toplam_Depozit=("Depozit", "sum"),
+        Toplam_Dep_Adet=("Dep Adet", "sum"),
         Toplam_Ek_Sure=("Ek Sure Dk", "sum"),
         Toplam_Zoiper_Sure=("Zoiper Sure Dk", "sum"),
         Toplam_Dk=("Toplam Dk", "sum"),
     ).reset_index()
 
     ozet["Ort. Arama Sayısı"] = (ozet["Toplam_Arama"] / ozet["Gun_Sayisi"]).round(1)
-    ozet["Ort. Ek Süre (dk)"] = (ozet["Toplam_Ek_Sure"] / ozet["Gun_Sayisi"]).round(1)
-    ozet["Ort. Zoiper Süre (dk)"] = (ozet["Toplam_Zoiper_Sure"] / ozet["Gun_Sayisi"]).round(1)
+    ozet["Ort. Arama Süresi (dk)"] = (ozet["Toplam_Arama_Suresi"] / ozet["Gun_Sayisi"]).round(1)
+    ozet["Ort. Depozit"] = (ozet["Toplam_Depozit"] / ozet["Gun_Sayisi"]).round(1)
+    ozet["Ort. Dep Adet"] = (ozet["Toplam_Dep_Adet"] / ozet["Gun_Sayisi"]).round(1)
     ozet["Ort. Toplam Dk"] = (ozet["Toplam_Dk"] / ozet["Gun_Sayisi"]).round(1)
 
     ozet = ozet.merge(uyeler_df[["Ad Soyad", "Birim"]], on="Ad Soyad", how="left")
 
-    return ozet[["Ad Soyad", "Birim", "Gun_Sayisi", "Ort. Arama Sayısı", "Ort. Ek Süre (dk)", "Ort. Zoiper Süre (dk)", "Ort. Toplam Dk"]].rename(
+    return ozet[["Ad Soyad", "Birim", "Gun_Sayisi", "Ort. Arama Sayısı", "Ort. Arama Süresi (dk)", "Ort. Depozit", "Ort. Dep Adet", "Ort. Toplam Dk"]].rename(
         columns={"Gun_Sayisi": "Hesaba Katılan Gün Sayısı"}
     )
 
@@ -352,7 +389,7 @@ kayitlar = load_kayitlar()
 if st.session_state.admin:
     tab1, tab2, tab3 = st.tabs(["📋 Günlük Veri Girişi", "👥 Birim Yönetimi", "🧩 Ayrıştırma (Otomatik Doldur)"])
 
-    # ---------------- TAB 1: GUNLUK VERI GIRISI ----------------
+    # ---------------- TAB 1: GUNLUK VERI GIRISI (BIRIME OZEL ALANLAR) ----------------
     with tab1:
         st.subheader(f"{tarih_str} için Görüşme Verisi Girişi")
         if uyeler.empty:
@@ -370,22 +407,54 @@ if st.session_state.admin:
                         dahili = kisi["Dahili"]
                         mevcut = kayitlar[(kayitlar["Tarih"] == tarih_str) & (kayitlar["Ad Soyad"] == ad)]
                         m = mevcut.iloc[0] if not mevcut.empty else None
-                        st.markdown(f"**{ad}**  ({dahili})")
+                        st.markdown(f"**{ad}**  (Dahili: {dahili})")
                         mevcut_izin = m["Izin Durumu"] if m is not None and "Izin Durumu" in m else "Yok"
                         izin_idx = IZIN_SECENEKLERI.index(mevcut_izin) if mevcut_izin in IZIN_SECENEKLERI else 0
-                        c0, c1, c2, c3, c4, c5 = st.columns([1.3, 1, 1, 1, 1, 1])
-                        izin_durumu = c0.selectbox("İzin Durumu", IZIN_SECENEKLERI, index=izin_idx, key=f"izin_{ad}_{tarih_str}")
-                        arama = c1.number_input("Arama Sayısı", min_value=0, value=int(m["Arama Sayisi"]) if m is not None else 0, key=f"arama_{ad}_{tarih_str}")
-                        zoiper_saat = c2.number_input("Zoiper Saat", min_value=0, value=int(m["Zoiper Sure Dk"]) // 60 if m is not None else 0, key=f"zsaat_{ad}_{tarih_str}")
-                        zoiper_dk_in = c3.number_input("Zoiper Dk", min_value=0, max_value=59, value=int(m["Zoiper Sure Dk"]) % 60 if m is not None else 0, key=f"zdk_{ad}_{tarih_str}")
-                        ek_saat = c4.number_input("Ek Süre Saat", min_value=0, value=int(m["Ek Sure Dk"]) // 60 if m is not None else 0, key=f"esaat_{ad}_{tarih_str}")
-                        ek_dk_in = c5.number_input("Ek Süre Dk", min_value=0, max_value=59, value=int(m["Ek Sure Dk"]) % 60 if m is not None else 0, key=f"edk_{ad}_{tarih_str}")
-                        st.markdown("---")
-                        girisler.append({
-                            "Ad Soyad": ad, "Dahili": dahili, "Arama Sayisi": arama,
-                            "Ek Sure Dk": ek_saat * 60 + ek_dk_in, "Zoiper Sure Dk": zoiper_saat * 60 + zoiper_dk_in,
-                            "Izin Durumu": izin_durumu,
-                        })
+
+                        if birim == "Retler":
+                            c0, c1, c2, c3, c4, c5 = st.columns([1.2, 1, 1, 1, 1, 1])
+                            izin_durumu = c0.selectbox("İzin Durumu", IZIN_SECENEKLERI, index=izin_idx, key=f"izin_{ad}_{tarih_str}")
+                            arama = c1.number_input("Arama Sayısı", min_value=0, value=int(m["Arama Sayisi"]) if m is not None else 0, key=f"arama_{ad}_{tarih_str}")
+                            sure_saat = c2.number_input("Arama Süresi Saat", min_value=0, value=int(m["Arama Suresi Dk"]) // 60 if m is not None else 0, key=f"suresaat_{ad}_{tarih_str}")
+                            sure_dk = c3.number_input("Arama Süresi Dk", min_value=0, max_value=59, value=int(m["Arama Suresi Dk"]) % 60 if m is not None else 0, key=f"suredk_{ad}_{tarih_str}")
+                            depozit = c4.number_input("Depozit", min_value=0, value=int(m["Depozit"]) if m is not None else 0, key=f"depozit_{ad}_{tarih_str}")
+                            dep_adet = c5.number_input("Dep Adet", min_value=0, value=int(m["Dep Adet"]) if m is not None else 0, key=f"depadet_{ad}_{tarih_str}")
+                            st.markdown("---")
+                            girisler.append({
+                                "Ad Soyad": ad, "Dahili": dahili, "Arama Sayisi": arama,
+                                "Arama Suresi Dk": sure_saat * 60 + sure_dk,
+                                "Depozit": depozit, "Dep Adet": dep_adet,
+                                "Izin Durumu": izin_durumu,
+                            })
+
+                        elif birim == "Satış Ekibi":
+                            c0, c1, c2, c3 = st.columns([1.2, 1, 1, 1])
+                            izin_durumu = c0.selectbox("İzin Durumu", IZIN_SECENEKLERI, index=izin_idx, key=f"izin_{ad}_{tarih_str}")
+                            arama = c1.number_input("Arama Sayısı", min_value=0, value=int(m["Arama Sayisi"]) if m is not None else 0, key=f"arama_{ad}_{tarih_str}")
+                            sure_saat = c2.number_input("Arama Süresi Saat", min_value=0, value=int(m["Arama Suresi Dk"]) // 60 if m is not None else 0, key=f"suresaat_{ad}_{tarih_str}")
+                            sure_dk = c3.number_input("Arama Süresi Dk", min_value=0, max_value=59, value=int(m["Arama Suresi Dk"]) % 60 if m is not None else 0, key=f"suredk_{ad}_{tarih_str}")
+                            st.markdown("---")
+                            girisler.append({
+                                "Ad Soyad": ad, "Dahili": dahili, "Arama Sayisi": arama,
+                                "Arama Suresi Dk": sure_saat * 60 + sure_dk,
+                                "Izin Durumu": izin_durumu,
+                            })
+
+                        else:  # Teknik Birim / Atanmamış -> eski duzen (zoiper + ek sure)
+                            c0, c1, c2, c3, c4, c5 = st.columns([1.2, 1, 1, 1, 1, 1])
+                            izin_durumu = c0.selectbox("İzin Durumu", IZIN_SECENEKLERI, index=izin_idx, key=f"izin_{ad}_{tarih_str}")
+                            arama = c1.number_input("Arama Sayısı", min_value=0, value=int(m["Arama Sayisi"]) if m is not None else 0, key=f"arama_{ad}_{tarih_str}")
+                            zoiper_saat = c2.number_input("Zoiper Saat", min_value=0, value=int(m["Zoiper Sure Dk"]) // 60 if m is not None else 0, key=f"zsaat_{ad}_{tarih_str}")
+                            zoiper_dk_in = c3.number_input("Zoiper Dk", min_value=0, max_value=59, value=int(m["Zoiper Sure Dk"]) % 60 if m is not None else 0, key=f"zdk_{ad}_{tarih_str}")
+                            ek_saat = c4.number_input("Ek Süre Saat", min_value=0, value=int(m["Ek Sure Dk"]) // 60 if m is not None else 0, key=f"esaat_{ad}_{tarih_str}")
+                            ek_dk_in = c5.number_input("Ek Süre Dk", min_value=0, max_value=59, value=int(m["Ek Sure Dk"]) % 60 if m is not None else 0, key=f"edk_{ad}_{tarih_str}")
+                            st.markdown("---")
+                            girisler.append({
+                                "Ad Soyad": ad, "Dahili": dahili, "Arama Sayisi": arama,
+                                "Ek Sure Dk": ek_saat * 60 + ek_dk_in, "Zoiper Sure Dk": zoiper_saat * 60 + zoiper_dk_in,
+                                "Izin Durumu": izin_durumu,
+                            })
+
                 gonder = st.form_submit_button("💾 Tümünü Kaydet", type="primary", use_container_width=True)
                 if gonder:
                     bulk_upsert_kayitlar(tarih_str, girisler)
@@ -395,7 +464,7 @@ if st.session_state.admin:
     # ---------------- TAB 2: BIRIM YONETIMI ----------------
     with tab2:
         st.subheader("Üye / Birim Yönetimi")
-        st.caption("Aşağıdaki tabloyu doğrudan düzenleyebilirsiniz. Birim sütununa: " + ", ".join(BIRIMLER))
+        st.caption("Aşağıdaki tabloyu doğrudan düzenleyebilirsiniz. Dahili numarası burada sabitlenir. Birim sütununa: " + ", ".join(BIRIMLER))
         duzenlenmis = st.data_editor(
             uyeler if not uyeler.empty else pd.DataFrame(columns=UYELER_HEADERS),
             num_rows="dynamic",
@@ -413,7 +482,7 @@ if st.session_state.admin:
     # ---------------- TAB 3: AYRISTIRMA ----------------
     with tab3:
         st.subheader("Otomatik Ayrıştırma")
-        st.caption("İki farklı listeyi (Adet ve Süre raporları) aşağıya yapıştırın. Sistem 'MERKEZ' ibaresini kaldırır, süreleri dakikaya çevirir (saniye kalırsa yukarı yuvarlar) ve Dahili numarasına göre eşleştirir.")
+        st.caption("İki farklı listeyi (Adet ve Süre raporları) aşağıya yapıştırın. Sistem 'MERKEZ' ibaresini kaldırır, süreleri dakikaya çevirir (saniye kalırsa yukarı yuvarlar) ve Dahili numarasına göre eşleştirir. Sonuç 'Arama Süresi' alanına yazılır; Retler için Depozit/Dep Adet'i ve birimi elle tamamlamanız gerekir.")
         c1, c2 = st.columns(2)
         with c1:
             blok_adet = st.text_area("Arama Sayısı Listesi (Site Adet Dahili Ad Soyad)", height=300, placeholder="MERKEZ 242 4004 DOGUKAN BASARAN")
@@ -424,19 +493,19 @@ if st.session_state.admin:
             df_adet = parse_block(blok_adet, "Arama Sayısı")
             df_sure = parse_block(blok_sure, "Süre")
             if not df_sure.empty:
-                df_sure["Zoiper Süre (dk)"] = df_sure["Süre"].apply(hhmmss_to_dk)
+                df_sure["Arama Süresi (dk)"] = df_sure["Süre"].apply(hhmmss_to_dk)
             merged = pd.merge(
                 df_adet[["Dahili", "Ad Soyad", "Arama Sayısı"]] if not df_adet.empty else pd.DataFrame(columns=["Dahili", "Ad Soyad", "Arama Sayısı"]),
-                df_sure[["Dahili", "Zoiper Süre (dk)"]] if not df_sure.empty else pd.DataFrame(columns=["Dahili", "Zoiper Süre (dk)"]),
+                df_sure[["Dahili", "Arama Süresi (dk)"]] if not df_sure.empty else pd.DataFrame(columns=["Dahili", "Arama Süresi (dk)"]),
                 on="Dahili", how="outer",
             )
-            # ad soyad bos kalirsa sure listesinden tamamla
             if not df_sure.empty:
                 ad_map = dict(zip(df_sure["Dahili"], df_sure["Ad Soyad"]))
                 merged["Ad Soyad"] = merged.apply(lambda r: r["Ad Soyad"] if pd.notna(r["Ad Soyad"]) else ad_map.get(r["Dahili"], ""), axis=1)
             merged["Arama Sayısı"] = pd.to_numeric(merged["Arama Sayısı"], errors="coerce").fillna(0).astype(int)
-            merged["Zoiper Süre (dk)"] = pd.to_numeric(merged["Zoiper Süre (dk)"], errors="coerce").fillna(0).astype(int)
-            merged["Ek Süre (dk)"] = 0
+            merged["Arama Süresi (dk)"] = pd.to_numeric(merged["Arama Süresi (dk)"], errors="coerce").fillna(0).astype(int)
+            merged["Depozit"] = 0
+            merged["Dep Adet"] = 0
             merged["Izin Durumu"] = "Yok"
             merged["Birim"] = "Atanmamış"
             st.session_state.ayristirma_sonuc = merged
@@ -455,7 +524,6 @@ if st.session_state.admin:
                 key="ayristirma_editor",
             )
             if st.button("Onayla ve Kaydet", type="primary"):
-                # uyeler listesine yeni kisileri / birimleri isle
                 u = load_uyeler()
                 for _, r in duzenlenmis2.iterrows():
                     dahili = str(r["Dahili"])
@@ -465,12 +533,12 @@ if st.session_state.admin:
                     else:
                         u.loc[u["Dahili"] == dahili, "Birim"] = r["Birim"]
                 save_uyeler(u)
-                # o gunun kayitlarini TEK seferde isle
                 kayit_listesi = [
                     {
                         "Ad Soyad": r["Ad Soyad"], "Dahili": str(r["Dahili"]),
-                        "Arama Sayisi": r["Arama Sayısı"], "Ek Sure Dk": r["Ek Süre (dk)"],
-                        "Zoiper Sure Dk": r["Zoiper Süre (dk)"], "Izin Durumu": r.get("Izin Durumu", "Yok"),
+                        "Arama Sayisi": r["Arama Sayısı"], "Arama Suresi Dk": r["Arama Süresi (dk)"],
+                        "Depozit": r.get("Depozit", 0), "Dep Adet": r.get("Dep Adet", 0),
+                        "Izin Durumu": r.get("Izin Durumu", "Yok"),
                     }
                     for _, r in duzenlenmis2.iterrows()
                 ]
@@ -480,7 +548,7 @@ if st.session_state.admin:
                 st.rerun()
 
 # ----------------------------------------------------------------------------------
-# HERKESE ACIK GORUNUM (SADECE O GUNUN TABLOSU)
+# HERKESE ACIK GORUNUM (SADECE O GUNUN TABLOSU) - HER BIRIM KENDI DUZENINDE
 # ----------------------------------------------------------------------------------
 st.markdown("---")
 st.subheader(f"📊 {tarih_str} Tarihli Görüşme Tablosu")
@@ -490,58 +558,77 @@ if uyeler.empty:
 else:
     gunun_kayitlari = kayitlar[kayitlar["Tarih"] == tarih_str] if not kayitlar.empty else pd.DataFrame(columns=KAYITLAR_HEADERS)
 
-    # onec tum birimlerin gosterim tablolarini hazirla
-    birim_gosterimleri = {}
-    for birim in BIRIMLER + ["Atanmamış"]:
+    def hazirla(birim):
         grup_uyeler = uyeler[uyeler["Birim"] == birim] if birim != "Atanmamış" else uyeler[~uyeler["Birim"].isin(BIRIMLER)]
         if grup_uyeler.empty:
-            continue
+            return None
         birlesik = grup_uyeler.merge(gunun_kayitlari, on="Ad Soyad", how="left", suffixes=("", "_k"))
-        for c, default in [("Arama Sayisi", 0), ("Ek Sure Dk", 0), ("Zoiper Sure Dk", 0), ("Toplam Dk", 0)]:
-            birlesik[c] = pd.to_numeric(birlesik[c], errors="coerce").fillna(default).astype(int)
+        for c in SAYISAL_KOLONLAR:
+            birlesik[c] = pd.to_numeric(birlesik[c], errors="coerce").fillna(0).astype(int)
         birlesik["Izin Durumu"] = birlesik["Izin Durumu"].fillna("Yok")
+        birlesik["Dahili"] = birlesik["Dahili"].astype(str)
+        return birlesik
 
-        gosterim = birlesik[["Ad Soyad", "Arama Sayisi", "Ek Sure Dk", "Zoiper Sure Dk", "Toplam Dk", "Izin Durumu"]].rename(columns={
-            "Ad Soyad": "İsim Soyisim", "Arama Sayisi": "Arama Sayısı", "Ek Sure Dk": "Ek Süre (dk)",
-            "Zoiper Sure Dk": "Zoiper Süre (dk)", "Toplam Dk": "Toplam Dk",
+    # ---------------- RETLER ----------------
+    retler_df = hazirla("Retler")
+    if retler_df is not None:
+        gosterim = retler_df.rename(columns={"Ad Soyad": "İsim Soyisim", "Arama Sayisi": "Arama Sayısı", "Arama Suresi Dk": "Arama Süresi (dk)"})
+        gosterim = gosterim[["İsim Soyisim", "Dahili", "Arama Sayısı", "Arama Süresi (dk)", "Depozit", "Dep Adet", "Izin Durumu"]]
+        dep_min, dep_max, sure_min, sure_max = retler_hesapla_minmax(gosterim)
+        gosterim["Not"] = gosterim.apply(lambda r: retler_notu(r, dep_min, dep_max, sure_min, sure_max, emoji=True), axis=1)
+        st.markdown("#### Retler")
+        st.dataframe(retler_style(gosterim, dep_min, dep_max), use_container_width=True, hide_index=True)
+        st.caption("🟩 En yüksek depozit   ⏱️ En yüksek arama süresi (renksiz, sadece ibare)   🟦 Tam gün izinli   🟪 Yarım gün izinli")
+        if st.button("🖼️ Retler Görseli Oluştur (PNG)"):
+            st.session_state.retler_png = build_retler_image(tarih_str, gosterim, dep_min, dep_max, sure_min, sure_max)
+            st.session_state.retler_png_tarih = tarih_str
+        if st.session_state.get("retler_png") and st.session_state.get("retler_png_tarih") == tarih_str:
+            st.image(st.session_state.retler_png, caption=f"{tarih_str} — Retler")
+            st.download_button("📥 Retler PNG indir", data=st.session_state.retler_png, file_name=f"retler_{tarih_str}.png", mime="image/png", key="retler_indir")
+
+    st.markdown("---")
+
+    # ---------------- SATIŞ EKİBİ ----------------
+    satis_df = hazirla("Satış Ekibi")
+    if satis_df is not None:
+        gosterim = satis_df.rename(columns={"Ad Soyad": "İsim Soyisim", "Arama Sayisi": "Arama Sayısı", "Arama Suresi Dk": "Arama Süresi (dk)"})
+        gosterim = gosterim[["İsim Soyisim", "Dahili", "Arama Sayısı", "Arama Süresi (dk)", "Izin Durumu"]]
+        min_val, max_val = satis_hesapla_minmax(gosterim)
+        gosterim["Not"] = gosterim.apply(lambda r: satis_notu(r, min_val, max_val, emoji=True), axis=1)
+        st.markdown("#### Satış Ekibi")
+        st.dataframe(satis_style(gosterim, min_val, max_val), use_container_width=True, hide_index=True)
+        st.caption("🟩 En yüksek arama süresi   🟥 En düşük arama süresi   🟦 Tam gün izinli   🟪 Yarım gün izinli")
+        if st.button("🖼️ Satış Ekibi Görseli Oluştur (PNG)"):
+            st.session_state.satis_png = build_satis_image(tarih_str, gosterim, min_val, max_val)
+            st.session_state.satis_png_tarih = tarih_str
+        if st.session_state.get("satis_png") and st.session_state.get("satis_png_tarih") == tarih_str:
+            st.image(st.session_state.satis_png, caption=f"{tarih_str} — Satış Ekibi")
+            st.download_button("📥 Satış Ekibi PNG indir", data=st.session_state.satis_png, file_name=f"satis_ekibi_{tarih_str}.png", mime="image/png", key="satis_indir")
+
+    st.markdown("---")
+
+    # ---------------- TEKNIK BIRIM (RENKSIZ, ESKI DUZEN) ----------------
+    teknik_df = hazirla("Teknik Birim")
+    if teknik_df is not None:
+        gosterim = teknik_df.rename(columns={
+            "Ad Soyad": "İsim Soyisim", "Arama Sayisi": "Arama Sayısı",
+            "Ek Sure Dk": "Ek Süre (dk)", "Zoiper Sure Dk": "Zoiper Süre (dk)",
         })
-        birim_gosterimleri[birim] = gosterim
+        gosterim = gosterim[["İsim Soyisim", "Arama Sayısı", "Ek Süre (dk)", "Zoiper Süre (dk)", "Toplam Dk", "Izin Durumu"]]
+        st.markdown("#### Teknik Birim")
+        st.dataframe(teknik_style(gosterim), use_container_width=True, hide_index=True)
+        st.caption("🟦 Tam gün izinli   🟪 Yarım gün izinli   (renk skalası uygulanmaz)")
 
-    # Retler + Satis Ekibi ayri ayri degil, TEK HAVUZ olarak min/max hesapla
-    havuz_parcalari = [df for b, df in birim_gosterimleri.items() if b in RENK_SKALASI_UYGULANAN_BIRIMLER]
-    if havuz_parcalari:
-        havuz = pd.concat(havuz_parcalari, ignore_index=True)
-        genel_min, genel_max = hesapla_minmax(havuz, True)
-    else:
-        genel_min = genel_max = None
-
-    png_gruplari = []
-    for birim, gosterim in birim_gosterimleri.items():
-        apply_minmax = birim in RENK_SKALASI_UYGULANAN_BIRIMLER
-        min_val, max_val = (genel_min, genel_max) if apply_minmax else (None, None)
-        gosterim["Not"] = gosterim.apply(lambda r: satir_notu(r, apply_minmax, min_val, max_val, emoji=True), axis=1)
-
-        st.markdown(f"#### {birim}")
-        stil = style_table_with_minmax(gosterim, apply_minmax, min_val, max_val)
-        st.dataframe(stil, use_container_width=True, hide_index=True)
-        png_gruplari.append((birim, gosterim, apply_minmax, min_val, max_val))
-
-st.caption("🟩 En yüksek görüşme süresi (Retler + Satış Ekibi geneli)   🟥 En düşük görüşme süresi (Retler + Satış Ekibi geneli)   🟨 120 dk altı   🟦 Tam gün izinli   🟪 Yarım gün izinli")
-
-if not uyeler.empty and png_gruplari:
-    if st.button("🖼️ Görsel Oluştur (PNG)"):
-        png_bytes = build_table_image(tarih_str, png_gruplari)
-        if png_bytes:
-            st.session_state.png_bytes = png_bytes
-            st.session_state.png_tarih = tarih_str
-    if "png_bytes" in st.session_state and st.session_state.get("png_tarih") == tarih_str:
-        st.image(st.session_state.png_bytes, caption=f"{tarih_str} Görüşme Tablosu")
-        st.download_button(
-            "📥 PNG olarak bilgisayara indir",
-            data=st.session_state.png_bytes,
-            file_name=f"gorusme_tablosu_{tarih_str}.png",
-            mime="image/png",
-        )
+    # ---------------- ATANMAMIŞ (varsa, Teknik Birim ile ayni eski duzen) ----------------
+    atanmamis_df = hazirla("Atanmamış")
+    if atanmamis_df is not None:
+        gosterim = atanmamis_df.rename(columns={
+            "Ad Soyad": "İsim Soyisim", "Arama Sayisi": "Arama Sayısı",
+            "Ek Sure Dk": "Ek Süre (dk)", "Zoiper Sure Dk": "Zoiper Süre (dk)",
+        })
+        gosterim = gosterim[["İsim Soyisim", "Arama Sayısı", "Ek Süre (dk)", "Zoiper Süre (dk)", "Toplam Dk", "Izin Durumu"]]
+        st.markdown("#### Atanmamış")
+        st.dataframe(teknik_style(gosterim), use_container_width=True, hide_index=True)
 
 # ----------------------------------------------------------------------------------
 # ORTALAMA RAPOR (TARIH ARALIGI) - HAFTASONU VE TAM GUN IZIN HARIC
