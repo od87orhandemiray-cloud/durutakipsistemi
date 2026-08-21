@@ -336,6 +336,7 @@ def build_satis_image(tarih_str, df, min_val, max_val):
 
 def build_retler_image(tarih_str, df, dep_min, dep_max, sure_min, sure_max):
     columns = ["İsim Soyisim", "Dahili", "Arama Sayısı", "Arama Süresi", "Depozit", "Dep Adet", "İzin Durumu", "Not"]
+    df = df.sort_values("Depozit", ascending=False).reset_index(drop=True)
     satirlar = []
     for _, r in df.iterrows():
         renk = retler_rengi(r, dep_min, dep_max)
